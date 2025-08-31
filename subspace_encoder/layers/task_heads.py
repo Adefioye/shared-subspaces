@@ -27,25 +27,123 @@ from models.shared_space_encoder import (
 )
 
 
+# ----------------------------
+# BERT-style MLM head pieces
+# ----------------------------
+
+class _PredictionHeadTransform(nn.Module):
+    """
+    Matches BERT's transform block:
+        hidden -> Linear(D->D) -> ACT -> LayerNorm(D)
+    """
+    def __init__(self, config: SharedSpaceEncoderConfig):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        # Resolve activation like BERT's ACT2FN, with safe fallbacks
+        act = getattr(config, "hidden_act", "gelu")
+        if isinstance(act, str):
+            act_l = act.lower()
+            if act_l in ("gelu", "gelu_new"):   # treat gelu_new same as gelu for simplicity
+                self.act_fn = F.gelu
+            elif act_l == "relu":
+                self.act_fn = F.relu
+            elif act_l in ("silu", "swish"):
+                self.act_fn = F.silu
+            elif act_l == "tanh":
+                self.act_fn = torch.tanh
+            else:
+                raise ValueError(f"Unsupported activation: {act}")
+        else:
+            # Callable provided in config
+            self.act_fn = act
+        eps = getattr(config, "layer_norm_eps", 1e-12)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=eps)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = self.dense(hidden_states)
+        x = self.act_fn(x)
+        x = self.LayerNorm(x)
+        return x
+
+
+class _SharedSpaceLMPredictionHead(nn.Module):
+    """
+    BERT-like LM head that:
+      1) applies the transform block,
+      2) (optionally) projects to vocab latent subspace via encoder_model.vocab_proj,
+      3) decodes with a tied Linear to vocab embeddings and adds a learned bias.
+    """
+    def __init__(self, config: SharedSpaceEncoderConfig, encoder_model: SharedSpaceEncoderModel):
+        super().__init__()
+        self.transform = _PredictionHeadTransform(config)
+        self.encoder_model = encoder_model  # to access vocab_embed and optional vocab_proj
+
+        # Determine embedding (decoder input) dimension from the tied embeddings.
+        # If you use a subspace, vocab_embed.embedding_dim should be C; otherwise D.
+        emb_dim = encoder_model.vocab_embed.embedding_dim  # C or D
+        self.decoder = nn.Linear(emb_dim, config.vocab_size, bias=False)
+
+        # Per-token bias like BERT
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+        self.decoder.bias = self.bias  # keep the link so bias resizes together
+
+        # Tie decoder weights to input embeddings *when shapes match*
+        # (For subspace tying, vocab_embed.weight is [V, C]; otherwise [V, D].)
+        self._tie_decoder_to_embeddings()
+
+    def _tie_decoder_to_embeddings(self) -> None:
+        dec_w = self.decoder.weight      # [V, C or D]
+        emb_w = self.encoder_model.vocab_embed.weight  # [V, C or D]
+        if dec_w.shape == emb_w.shape:
+            # Make them the same parameter reference (true tying).
+            self.decoder.weight = emb_w
+        else:
+            # Fallback: shapes differ (shouldn't happen if emb_dim was taken from vocab_embed)
+            # We leave them untied to avoid shape errors.
+            pass
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Inputs:
+            hidden_states: [B, T, D]
+        Returns:
+            logits: [B, T, V]
+        """
+        x = self.transform(hidden_states)  # [B, T, D]
+
+        # Optional projection into vocab latent space (C) before decoding.
+        # Expect encoder_model.vocab_proj: Linear(D -> C) if present.
+        vocab_proj = getattr(self.encoder_model, "vocab_proj", None)
+        if vocab_proj is not None:
+            x = vocab_proj(x)  # [B, T, C]
+
+        logits = self.decoder(x)  # [B, T, V] (decoder tied to vocab_embed)
+        return logits
+
+
 class SharedSpaceEncoderForMaskedLM(SharedSpaceEncoderPreTrainedModel):
     """
-    The `*MaskedLM` object:
-        - Initializes:
-            - A `*Model` object from the given config.
-            - (It doesn't create a new LM head--we just use the vocabulary)
+    Refactored to mirror BERT's MLM head:
+      - Transform: Linear(D->D) + activation + LayerNorm
+      - Optional vocab subspace projection via `encoder_model.vocab_proj` (D->C)
+      - Decoder: Linear(C or D -> V), weight-tied to `encoder_model.vocab_embed.weight`
+      - Plus a learned output bias (per token), as in BERT
     """
 
     def __init__(self, config: SharedSpaceEncoderConfig) -> None:
-
-        # Call the `*PreTrainedModel` init.
         super().__init__(config)
-
-        # Create the `*Model`. Everything we need is already there.
         self.encoder_model = SharedSpaceEncoderModel(config)
-
-        # Call the `*PreTrainedModel` init
+        self.cls = _SharedSpaceLMPredictionHead(config, self.encoder_model)
         self.post_init()
 
+    # These two help HF-style resizing and weight tying workflows, if you use them.
+    def get_output_embeddings(self):
+        return self.cls.decoder
+
+    def set_output_embeddings(self, new_embeddings: nn.Linear):
+        self.cls.decoder = new_embeddings
+        # reattach bias link to keep resize semantics
+        self.cls.decoder.bias = self.cls.bias
 
     def forward(
         self,
@@ -53,94 +151,34 @@ class SharedSpaceEncoderForMaskedLM(SharedSpaceEncoderPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> MaskedLMOutput:
         """
-        The `labels` are token ids with the `[MASK]` token id at the masked
-        positions, and -100 (we tell the loss function this) everywhere else.
-        The `attention_mask`...
-
         Inputs:
-               input_ids: [batch_size, seq_len]
-          attention_mask: [batch_size, 1, 1, seq_len]
-                 labels : [batch_size, seq_len]
-
-        The `logits` are the prediction scores over the vocabulary.
-        The `loss` is a scalar value... per sample in the batch? It has had
-        the mask applied to it? cross-entropy. Only when labels provided, otherwise it's...
+               input_ids:      [B, T]
+          attention_mask:      broadcastable mask as expected by encoder_model
+                 labels:       [B, T], with -100 for non-masked positions
 
         Outputs:
-           logits: [batch_size, seq_len, vocab_size]  Predction scores over vocab
-             loss: [batch_size]? Or average over batch?
+               logits:         [B, T, V]
+                 loss:         scalar (mean over masked positions) if labels provided, else None
         """
-
-        # Run the input through the whole model.
+        # Run encoder; expected to return last hidden state [B, T, D]
         hidden_states = self.encoder_model(
             input_ids,
             attention_mask=attention_mask,
-            **kwargs, # TODO - What can be passed here?
+            **kwargs,
         )
 
-        # Retrieve the vocabulary.
-        W_E = self.encoder_model.vocab_embed.weight
+        # If your SharedSpaceEncoderModel returns a dataclass, uncomment:
+        # hidden_states = hidden_states.last_hidden_state
 
-        # The hidden states are model size. If the vocabulary was decomposed,
-        # We need to down project, and then multiply with the vocabulary latents.
-        # Otherwise, multiply directly with the vocabulary embeddings.
-        # --- Shared projection → logits  -------------------
+        # BERT-style head (transform + optional subspace + tied decoder + bias)
+        logits = self.cls(hidden_states)  # [B, T, V]
 
-        if self.encoder_model.vocab_proj is not None:
-            #  B - batch_size
-            #  T - sequence length
-            #  D - model_size
-            #  C - latent_size
-            #  V - vocab_size
-
-            # Linear stores the transpose of its projection, so vocab_proj
-            # is functionally [C x D], but stored as [D x C]
-            # So the vocabulary latent space projection, W_E_proj, is [D x C]
-            W_E_proj = self.encoder_model.vocab_proj.weight
-
-            # Project the tokens output by the model into the vocabulary
-            # subspace.
-            #
-            # Inputs:
-            #    hidden_states   [B, T, D]
-            #         W_E_proj         [D, C]
-            # Outputs:
-            #        h_latents   [B, T, C]
-            #
-            #  TODO - Fuse with the next op if beneficial.
-            #h_latents = einsum('btd,dc->btc', hidden_states, W_E_proj)
-
-            # Multiply each token latent with every vocabulary latent to
-            # get the per-token logit scores over the vocabulary.
-            #
-            # Inputs:
-            #      h_latents   [B, T, C]
-            #            W_E   [V, C]
-            # Outputs:
-            #    logits  [B, T, V]
-            #logits = einsum('btc,vc->btv', h_latents, self.vocab_embed.weight)
-
-            logits = torch.einsum('btd,dc,vc->btv', hidden_states, W_E_proj, W_E)
-
-        # If there's no vocabulary subspace,
-        else:
-            # Multiply the hidden states with the vocabulary.
-            #
-            # Inputs:
-            #    hidden_states   [B, T, D]
-            #              W_E   [V, D]
-            # Outputs:
-            #    logits  [B, T, V]
-            logits = torch.einsum('btd,vd->btv', hidden_states, W_E)
-
-        vocab_size = W_E.size(0)
-
-        # If labels are provided,
         loss = None
         if labels is not None:
-            # Flatten everything for F.cross_entropy
+            # Cross-entropy over masked positions (-100 ignored).
+            vocab_size = logits.size(-1)
             loss = F.cross_entropy(
                 logits.view(-1, vocab_size),
                 labels.view(-1),
@@ -154,14 +192,6 @@ class SharedSpaceEncoderForMaskedLM(SharedSpaceEncoderPreTrainedModel):
             attentions=None,
         )
 
-
-
-        # Return the output as a dictionary.
-        output = {
-            "logits": logits,
-            "loss": loss,
-        }
-        return output
 
 """#### `*ForSequenceClassification`
 
