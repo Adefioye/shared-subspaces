@@ -155,6 +155,7 @@ class SharedSpaceEncoderConfig(PretrainedConfig):
         self,
 
         # === Core Model ===
+        hidden_act:         str = "gelu",
         vocab_size:         int = 30522,
         hidden_size:        int = 512,
         num_hidden_layers:  int = 12,
@@ -201,6 +202,7 @@ class SharedSpaceEncoderConfig(PretrainedConfig):
 
 
         # === Core Model ===
+        self.hidden_act = hidden_act
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers

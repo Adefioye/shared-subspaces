@@ -5,6 +5,7 @@
   
   "model": {
   	
+    "hidden_act":           "gelu",
 	"hidden_size":          256,
     "num_hidden_layers":    6,
     "intermediate_size":    1024,
