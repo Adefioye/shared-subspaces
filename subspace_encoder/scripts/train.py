@@ -182,6 +182,7 @@ def main(config_path: str):
     # ===============================
 
     training_args = TrainingArguments(
+        save_safetensors=False,  # Whether to save in safetensors format. Just to keep training/checkpointing going for now.
         output_dir=ptrain_cfg["output_dir"],
 
         per_device_train_batch_size=ptrain_cfg["train_batch_size"],

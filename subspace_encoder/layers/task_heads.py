@@ -192,6 +192,34 @@ class SharedSpaceEncoderForMaskedLM(SharedSpaceEncoderPreTrainedModel):
             attentions=None,
         )
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        # Let HF find the *real* embeddings through the encoder.
+        return self.encoder_model.get_input_embeddings()
+
+    def set_input_embeddings(self, new_embeddings: nn.Embedding) -> None:
+        self.encoder_model.set_input_embeddings(new_embeddings)
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        """
+        Ensure both input embeddings and tied decoder stay consistent when resizing.
+        """
+        new_emb = self.encoder_model.resize_token_embeddings(new_num_tokens)
+        # If your decoder is tied (you already do this in _SharedSpaceLMPredictionHead),
+        # the weight pointer will still match; just ensure vocab_size stays in sync:
+        self.config.vocab_size = new_num_tokens
+        # Also keep the per-token bias sized correctly:
+        if hasattr(self, "cls") and hasattr(self.cls, "bias"):
+            old_bias = self.cls.bias
+            if old_bias.numel() != new_num_tokens:
+                new_bias = nn.Parameter(old_bias.new_zeros(new_num_tokens))
+                with torch.no_grad():
+                    copy_n = min(old_bias.numel(), new_num_tokens)
+                    new_bias[:copy_n].copy_(old_bias[:copy_n])
+                self.cls.bias = new_bias
+                # keep decoder.bias pointing to the same Parameter
+                self.cls.decoder.bias = self.cls.bias
+        return new_emb
+
 
 """#### `*ForSequenceClassification`
 

@@ -373,3 +373,44 @@ class SharedSpaceEncoderModel(SharedSpaceEncoderPreTrainedModel):
         # Return the final output of the encoder stack.
         return hidden_states
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        """
+        Return the nn.Embedding that holds token vectors.
+        - Dense vocab:   [V, D]
+        - Subspace vocab: [V, C]  (C = config.vocab_rank)
+        """
+        return self.vocab_embed
+
+    def set_input_embeddings(self, new_embeddings: nn.Embedding) -> None:
+        """
+        Replace the token embedding module. Validates dimensionality against config.
+        """
+        expected_dim = self.config.hidden_size if self.vocab_proj is None else self.config.vocab_rank
+        if new_embeddings.embedding_dim != expected_dim:
+            raise ValueError(
+                f"Expected embedding dim {expected_dim}, got {new_embeddings.embedding_dim}. "
+                f"(vocab_subspace={self.vocab_proj is not None})"
+            )
+        self.vocab_embed = new_embeddings
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        """
+        HF-compatible resize that preserves existing weights.
+        Works for both dense (D) and subspace (C) vocab.
+        """
+        old_emb = self.get_input_embeddings()
+        old_num_tokens, emb_dim = old_emb.weight.shape
+        if new_num_tokens == old_num_tokens:
+            return old_emb
+
+        new_emb = nn.Embedding(new_num_tokens, emb_dim)
+        # copy overlap
+        num_to_copy = min(old_num_tokens, new_num_tokens)
+        with torch.no_grad():
+            new_emb.weight[:num_to_copy].copy_(old_emb.weight[:num_to_copy])
+
+        self.set_input_embeddings(new_emb)
+        # keep config in sync
+        self.config.vocab_size = new_num_tokens
+        return new_emb
+

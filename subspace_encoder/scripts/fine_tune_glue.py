@@ -1,8 +1,18 @@
 import os
+from pathlib import Path
+import sys
 
 # Disable tensorflow to avoid noisy warnings
 # (Though this doesn't seem to work)
 os.environ["TRANSFORMERS_NO_TF"] = "1"
+
+# Make sure we can import modules from the encoder-pretrain package
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+print("PROJECT_ROOT", PROJECT_ROOT)
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import argparse
 import json
