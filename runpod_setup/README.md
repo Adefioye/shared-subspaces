@@ -1,22 +1,41 @@
 ## Set up project to be run on runpod
 
-1. Clone project repository and switch to remote branch with your changes
+1. Set up miniconda to create virtual environment
 ```
-# 1. Clone the repository
+# Make the file executable
+chmod +x runpod_setup/install_miniconda.sh
+
+# Execute the file
+./runpod_setup/install_miniconda.sh
+```
+
+2. Create conda environment and install required dependencies.
+>NOTE: run `setup_dev_env.sh` from root project directory.
+```
+# Make the file executable
+chmod +x runpod_setup/setup_dev_env.sh
+
+# Execute the file
+./runpod_setup/setup_dev_env.sh
+```
+
+3. Clone project repository and switch to remote branch with your changes
+```
+# Clone the repository
 git clone <repo-url>
 cd <repo-folder>
 
-# 2. Fetch all branches from remote
+# Fetch all branches from remote
 git fetch origin
 
-# 3. Check out the branch
+# Check out the branch
 git checkout <branch-name>
 
-# 4. (Optional) Set it to track the remote branch
+# (Optional) Set it to track the remote branch
 git checkout -b <branch-name> origin/<branch-name>
 ```
 
-2. When launching pre-training/fine-tuning run on __runpod__, do the following:
+4. BEFORE launching pre-training/fine-tuning runs on __runpod__, do the following:
 - Set wandb token using
 ```
 wandb login
