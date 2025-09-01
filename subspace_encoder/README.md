@@ -208,16 +208,6 @@ Or a fine-tuning run with:
 python scripts/fine_tune_glue.py --config configs/mha_baseline.json
 ```
 
->NOTE: If launching pre-training/fine-tuning run on __runpod__, do the following:
-1. Set wandb token using
-```
-wandb login
-```
-2. set `WANDB_MODE` to `online` to ensure logs are sent to wandb.
-```
-export WANDB_MODE=online
-```
-
 _Current configurations:_
 
 These are the highest scoring configurations of the three variants:
